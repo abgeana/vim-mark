@@ -1,22 +1,17 @@
 " Script Name: mark.vim
 " Description: Highlight several words in different colors simultaneously.
 "
-" Copyright:   (C) 2008-2018 Ingo Karkat
+" Copyright:   (C) 2008-2020 Ingo Karkat
 "              (C) 2005-2008 Yuheng Xie
 "   The VIM LICENSE applies to this script; see ':help copyright'.
 "
 " Maintainer:  Ingo Karkat <ingo@karkat.de>
 "
 " DEPENDENCIES:
-"   - ingo/cmdargs/pattern.vim autoload script
-"   - ingo/err.vim autoload script
-"   - ingo/msg.vim autoload script
-"   - ingo/regexp.vim autoload script
-"   - ingo/regexp/magic.vim autoload script
-"   - ingo/regexp/split.vim autoload script
-"   - SearchSpecial.vim autoload script (optional, for improved search messages).
+"   - ingo-library.vim plugin
+"   - SearchSpecial.vim plugin (optional)
 "
-" Version:     3.1.0
+" Version:     3.1.1
 
 "- functions ------------------------------------------------------------------
 
@@ -231,7 +226,7 @@ function! mark#UpdateScope( ... )
 	let l:originalWindowLayout = winrestcmd()
 		let l:originalWinNr = winnr()
 		let l:previousWinNr = winnr('#') ? winnr('#') : 1
-			noautocmd windo call call('mark#UpdateMark', a:000)
+			noautocmd keepjumps windo call call('mark#UpdateMark', a:000)
 		noautocmd execute l:previousWinNr . 'wincmd w'
 		noautocmd execute l:originalWinNr . 'wincmd w'
 	silent! execute l:originalWindowLayout
@@ -516,11 +511,7 @@ endfunction
 
 " Return [mark text, mark start position, mark index] of the mark under the
 " cursor (or ['', [], -1] if there is no mark).
-" The mark can include the trailing newline character that concludes the line,
-" but marks that span multiple lines are not supported.
 function! mark#CurrentMark()
-	let line = getline('.') . "\n"
-
 	" Highlighting groups with higher numbers take precedence over lower numbers,
 	" and therefore its marks appear "above" other marks. To retrieve the visible
 	" mark in case of overlapping marks, we need to check from highest to lowest
@@ -528,20 +519,12 @@ function! mark#CurrentMark()
 	let i = s:markNum - 1
 	while i >= 0
 		if ! empty(s:pattern[i])
-			let matchPattern = (s:IsIgnoreCase(s:pattern[i]) ? '\c' : '\C') . s:pattern[i]
-			" Note: col() is 1-based, all other indexes zero-based!
-			let start = 0
-			while start >= 0 && start < strlen(line) && start < col('.')
-				let b = match(line, matchPattern, start)
-				let e = matchend(line, matchPattern, start)
-				if b < col('.') && col('.') <= e
-					return [s:pattern[i], [line('.'), (b + 1)], i]
-				endif
-				if b == e
-					break
-				endif
-				let start = e
-			endwhile
+			let l:matchPattern = (s:IsIgnoreCase(s:pattern[i]) ? '\c' : '\C') . s:pattern[i]
+
+			let [l:startPosition, l:endPosition] = ingo#area#frompattern#GetCurrent(l:matchPattern, {'firstLnum': 1, 'lastLnum': line('$')})
+			if l:startPosition != [0, 0]
+				return [s:pattern[i], l:startPosition, i]
+			endif
 		endif
 		let i -= 1
 	endwhile
@@ -844,47 +827,37 @@ endfunction
 function! mark#MarksVariablesComplete( ArgLead, CmdLine, CursorPos )
 	return sort(map(filter(keys(g:), 'v:val !~# "^MARK_\\%(MARKS\\|ENABLED\\)$" && v:val =~# "\\V\\^MARK_' . (empty(a:ArgLead) ? '\\S' : escape(a:ArgLead, '\')) . '"'), 'v:val[5:]'))
 endfunction
-function! s:HasVariablePersistence()
-	return (index(split(&viminfo, ','), '!') != -1)
+function! s:GetMarksVariable( ... )
+	return printf('MARK_%s', (a:0 ? a:1 : 'MARKS'))
 endfunction
 
 " :MarkLoad command.
 function! mark#LoadCommand( isShowMessages, ... )
-	if a:0
-		let l:marksVariable = printf('g:MARK_%s', a:1)
-		if exists(l:marksVariable)
-			let l:marks = eval(l:marksVariable)
-			let l:isEnabled = 1
-		else
-			call ingo#err#Set('No marks stored under ' . l:marksVariable . (s:HasVariablePersistence() || a:1 !~# '^\u\+$' ? '' : ", and persistence not configured via ! flag in 'viminfo'"))
-			return 0
-		endif
-	else
-		if exists('g:MARK_MARKS')
-			let l:marks = g:MARK_MARKS
-			let l:isEnabled = (exists('g:MARK_ENABLED') ? g:MARK_ENABLED : 1)
-		else
-			call ingo#err#Set('No persistent marks found' . (s:HasVariablePersistence() ? '' : ", and persistence not configured via ! flag in 'viminfo'"))
-			return 0
-		endif
-	endif
-
 	try
-		" Persistent global variables cannot be of type List, so we actually store
-		" the string representation, and eval() it back to a List.
-		execute printf('let l:loadedMarkNum = mark#Load(%s, %d)', l:marks, l:isEnabled)
+		let l:marksVariable = call('s:GetMarksVariable', a:000)
+		let l:isEnabled = (a:0 ? exists('g:' . l:marksVariable) : (exists('g:MARK_ENABLED') ? g:MARK_ENABLED : 1))
+
+		let l:marks = ingo#plugin#persistence#Load(l:marksVariable, [])
+		if empty(l:marks)
+			call ingo#err#Set('No marks stored under ' . l:marksVariable . (ingo#plugin#persistence#CanPersist(l:marksVariable) ? '' : ", and persistence not configured via ! flag in 'viminfo'"))
+			return 0
+		endif
+
+		let l:loadedMarkNum = mark#Load(l:marks, l:isEnabled)
+
 		if a:isShowMessages
 			if l:loadedMarkNum == 0
-				echomsg 'No persistent marks defined' . (exists('l:marksVariable') ? ' in ' . l:marksVariable : '')
+				echomsg 'No persistent marks defined in ' . l:marksVariable
 			else
 				echomsg printf('Loaded %d mark%s', l:loadedMarkNum, (l:loadedMarkNum == 1 ? '' : 's')) . (s:enabled ? '' : '; marks currently disabled')
 			endif
 		endif
+
 		return 1
-	catch /^Vim\%((\a\+)\)\=:/
-		if exists('l:marksVariable')
+	catch /^Load:/
+		if a:0
 			call ingo#err#Set(printf('Corrupted persistent mark info in %s', l:marksVariable))
-			execute 'unlet!' l:marksVariable
+			execute 'unlet! g:' . l:marksVariable
 		else
 			call ingo#err#Set('Corrupted persistent mark info in g:MARK_MARKS and g:MARK_ENABLED')
 			unlet! g:MARK_MARKS
@@ -898,29 +871,20 @@ endfunction
 function! s:SavePattern( ... )
 	let l:savedMarks = mark#ToList()
 
-	if a:0
-		try
-			if empty(l:savedMarks)
-				unlet! g:MARK_{a:1}
-			else
-				let g:MARK_{a:1} = string(l:savedMarks)
-			endif
-		catch /^Vim\%((\a\+)\)\=:/
-			call ingo#err#SetVimException()
-			return 0
-		endtry
-	else
-		let g:MARK_MARKS = string(l:savedMarks)
+	let l:marksVariable = call('s:GetMarksVariable', a:000)
+	call ingo#plugin#persistence#Store(l:marksVariable, l:savedMarks)
+	if ! a:0
 		let g:MARK_ENABLED = s:enabled
 	endif
+
 	return (empty(l:savedMarks) ? 2 : 1)
 endfunction
 function! mark#SaveCommand( ... )
-	if ! s:HasVariablePersistence()
+	if ! ingo#plugin#persistence#CanPersist()
 		if ! a:0
 			call ingo#err#Set("Cannot persist marks, need ! flag in 'viminfo': :set viminfo+=!")
 			return 0
-		elseif a:1 =~# '^\u\+$'
+		elseif a:1 =~# '^\L\+$'
 			call ingo#msg#WarningMsg("Cannot persist marks, need ! flag in 'viminfo': :set viminfo+=!")
 		endif
 	endif
